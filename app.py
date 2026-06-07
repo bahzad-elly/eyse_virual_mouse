@@ -9,54 +9,44 @@ import numpy as np
 pyautogui.FAILSAFE = True  
 pyautogui.PAUSE = 0.001
 
-class AdvancedGazeController:
+class UltimateGazeController:
     def __init__(self):
         self.screen_w, self.screen_h = pyautogui.size()
         
-        # Initialize MediaPipe Face Mesh with optimized parameters
+        # Optimized MediaPipe Configuration
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
             max_num_faces=1,
             refine_landmarks=True,
-            min_detection_confidence=0.8,  # Higher strictness for clean data
-            min_tracking_confidence=0.8
+            min_detection_confidence=0.6,  # Lowered slightly to prevent edge dropouts
+            min_tracking_confidence=0.6
         )
         
-        # Calibration bounds (normalized space relative to eye anchor)
-        self.calib_min_x = -0.05
-        self.calib_max_x = 0.05
-        self.calib_min_y = -0.05
-        self.calib_max_y = 0.05
+        # Initial Calibration Bounds (Will dynamically auto-adjust if user overshoots)
+        self.calib_min_x = -0.04
+        self.calib_max_x = 0.04
+        self.calib_min_y = -0.04
+        self.calib_max_y = 0.04
         
         # Control & Advanced Sensitivity Configuration
-        self.sensitivity_scale = 2.2  # Increased for easier edge reach without head movement
+        self.base_sensitivity = 2.5  
         self.smooth_x, self.smooth_y = self.screen_w // 2, self.screen_h // 2
         
         # Blink Detection Settings
-        self.BLINK_THRESHOLD = 5.4  # Finetuned to avoid accidental click triggers
+        self.BLINK_THRESHOLD = 5.4  
         self.blink_start_time = None
         self.click_triggered = False
 
-        # --- ADVANCED RADAR STATE TRACKING (KALMAN FILTER) ---
-        # State: [x, y, dx, dy] (Position and Velocity)
+        # Advanced Kalman Filtering States
         self.kalman = cv2.KalmanFilter(4, 2, 0)
-        self.kalman.measurementMatrix = np.array([[1, 0, 0, 0], 
-                                                  [0, 1, 0, 0]], np.float32)
-        self.kalman.transitionMatrix = np.array([[1, 0, 1, 0], 
-                                                 [0, 1, 0, 1], 
-                                                 [0, 0, 1, 0], 
-                                                 [0, 0, 0, 1]], np.float32)
-        self.kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03  # Handles jitter
-        self.kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5  # Rejects false skips
-        
-        # Initialize Kalman position to center screen
+        self.kalman.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
+        self.kalman.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
+        self.kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 0.05  
+        self.kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.3  
         self.kalman.statePost = np.array([[self.screen_w/2], [self.screen_h/2], [0], [0]], np.float32)
-        
-        # Track tracking health
-        self.last_valid_time = time.time()
 
     def get_head_pose_offsets(self, landmarks, img_w, img_h):
-        """ Estimates head orientation matrix to counteract posture changes. """
+        """ Computes head rotation values using iterative Perspective-n-Point solvers. """
         model_points = np.array([
             (0.0, 0.0, 0.0),             # Nose tip
             (0.0, -330.0, -65.0),        # Chin
@@ -85,30 +75,27 @@ class AdvancedGazeController:
         success, rotation_vector, _ = cv2.solvePnP(
             model_points, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
         )
-        
-        if success:
-            return rotation_vector[0][0], rotation_vector[1][0]
-        return 0.0, 0.0
+        return (rotation_vector[0][0], rotation_vector[1][0]) if success else (0.0, 0.0)
 
     def run_calibration(self, cap):
-        """ Interactive calibration sequence to lock down personal gaze endpoints. """
+        """ Executing an interactive fullscreen calibration matrix routine. """
         points = [
             ("CENTER", (self.screen_w // 2, self.screen_h // 2)),
-            ("TOP-LEFT", (80, 80)),
-            ("TOP-RIGHT", (self.screen_w - 80, 80)),
-            ("BOTTOM-LEFT", (80, self.screen_h - 80)),
-            ("BOTTOM-RIGHT", (self.screen_w - 80, self.screen_h - 80))
+            ("TOP-LEFT", (100, 100)),
+            ("TOP-RIGHT", (self.screen_w - 100, 100)),
+            ("BOTTOM-LEFT", (100, self.screen_h - 100)),
+            ("BOTTOM-RIGHT", (self.screen_w - 100, self.screen_h - 100))
         ]
         
         collected_x, collected_y = [], []
-        print("\n=== SYSTEM CALIBRATION ACTIVE ===")
-        print("Keep your head perfectly still. Move ONLY your eyes to look at the targets.")
+        print("\n=== INITIALIZING INTELLIGENT CALIBRATION ===")
+        print("Look directly at each target point using ONLY your eyes. Keep head steady.")
         
         for name, pos in points:
             start_time = time.time()
             temp_x, temp_y = [], []
             
-            while time.time() - start_time < 2.2:
+            while time.time() - start_time < 2.0:
                 success, frame = cap.read()
                 if not success: continue
                 
@@ -119,22 +106,21 @@ class AdvancedGazeController:
                 
                 calib_ui = np.zeros((self.screen_h, self.screen_w, 3), dtype=np.uint8)
                 
-                # Render Target Visuals
-                cv2.circle(calib_ui, pos, 20, (0, 165, 255), -1)
-                pulse = abs(int(8 + 14 * math.sin(time.time() * 15)))
+                # Visual targeting system UI
+                cv2.circle(calib_ui, pos, 22, (0, 120, 255), -1)
+                pulse = abs(int(6 + 12 * math.sin(time.time() * 14)))
                 cv2.circle(calib_ui, pos, pulse, (255, 255, 255), 2)
                 
-                cv2.putText(calib_ui, f"Focus here: {name}", (self.screen_w // 2 - 180, self.screen_h // 2), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(calib_ui, f"Focus View: {name}", (self.screen_w // 2 - 160, self.screen_h // 2), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
                 
-                cv2.imshow('System Output Display', calib_ui)
+                cv2.imshow('System Production Monitor', calib_ui)
                 cv2.waitKey(1)
                 
                 if results.multi_face_landmarks:
                     landmarks = results.multi_face_landmarks[0].landmark
-                    anchor = landmarks[362]  # Inner left eye corner
-                    iris = landmarks[468]    # Center iris point
-                    
+                    anchor = landmarks[362]  
+                    iris = landmarks[468]    
                     temp_x.append(iris.x - anchor.x)
                     temp_y.append(iris.y - anchor.y)
             
@@ -142,74 +128,83 @@ class AdvancedGazeController:
                 collected_x.append(np.median(temp_x))
                 collected_y.append(np.median(temp_y))
                 
-        # Lock in safety bounds
+        # Commit boundaries safely
         self.calib_min_x = min(collected_x)
         self.calib_max_x = max(collected_x)
         self.calib_min_y = min(collected_y)
         self.calib_max_y = max(collected_y)
-        
-        print("✔ Calibration Configured Successfully!")
+        print("✔ Base Calibration Matrix Acquired.")
 
     def update_pipeline(self, frame):
-        """ Core logic engine containing Kalman filtering matrices and positioning engines. """
+        """ Core logic tracking pipeline with auto-recovery and bounds adaptation. """
         img_h, img_w, _ = frame.shape
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(rgb_frame)
         
-        # Always run Kalman prediction step to keep state rolling smoothly
+        # Advance the Kalman filter prediction state ahead
         prediction = self.kalman.predict()
-        pred_x, pred_y = prediction[0][0], prediction[1][0]
 
         if not results.multi_face_landmarks:
-            # If tracking drops out completely, use the prediction to avoid mouse freezes
-            if time.time() - self.last_valid_time < 0.5: # 500ms grace period
-                pyautogui.moveTo(int(pred_x), int(pred_y))
+            # Dropback Auto-Recovery Mode: prevent mouse freezes during frame drops
+            pyautogui.moveTo(int(prediction[0][0]), int(prediction[1][0]))
             return frame
             
-        self.last_valid_time = time.time()
         landmarks = results.multi_face_landmarks[0].landmark
         
-        # 1. EYE TRANSFORMATION MATRICES
+        # 1. READ EYE POSITION 
         left_iris = landmarks[468]
         eye_anchor = landmarks[362]
         
         rel_x = left_iris.x - eye_anchor.x
         rel_y = left_iris.y - eye_anchor.y
         
-        # Counteract head sway using SolvePnP Pitch & Yaw
+        # Compensate head rotation angles dynamically
         pitch, yaw = self.get_head_pose_offsets(landmarks, img_w, img_h)
-        rel_x -= (yaw * 0.025)
-        rel_y += (pitch * 0.025)
+        rel_x -= (yaw * 0.022)
+        rel_y += (pitch * 0.022)
 
-        # Secure non-zero denominators
+        # --- ADVANCED IMPROVEMENT 1: AUTO-RELAXATION OF CALIBRATION BOUNDS ---
+        # If your eye moves further than what was recorded during calibration, 
+        # dynamically expand the bounds immediately instead of letting the mouse get stuck!
+        if rel_x < self.calib_min_x: self.calib_min_x = rel_x
+        if rel_x > self.calib_max_x: self.calib_max_x = rel_x
+        if rel_y < self.calib_min_y: self.calib_min_y = rel_y
+        if rel_y > self.calib_max_y: self.calib_max_y = rel_y
+
+        # Define denominators safely
         delta_x = max(0.012, self.calib_max_x - self.calib_min_x)
         delta_y = max(0.012, self.calib_max_y - self.calib_min_y)
 
-        # Scale raw signals out linearly
+        # Calculate a true normalized linear percentage value (0.0 to 1.0)
         norm_x = (rel_x - self.calib_min_x) / delta_x
         norm_y = (rel_y - self.calib_min_y) / delta_y
         
-        # Apply progressive center-outward scaling configuration multipliers
-        norm_x = 0.5 + (norm_x - 0.5) * self.sensitivity_scale
-        norm_y = 0.5 + (norm_y - 0.5) * self.sensitivity_scale
+        # --- ADVANCED IMPROVEMENT 2: NON-LINEAR CUBIC CURVE SCALING ---
+        # Instead of straight multiplying, we use an exponential power curve. 
+        # This gives high precision in the center, and massive acceleration at the edges.
+        diff_x = norm_x - 0.5
+        diff_y = norm_y - 0.5
         
-        # Raw Target Coordinates
-        target_x = norm_x * self.screen_w
-        target_y = norm_y * self.screen_h
+        # Cubic curve mapping formula ($f(x) = 0.5 + sign(dx) * |dx|^1.5 * scale$)
+        scaled_x = 0.5 + np.sign(diff_x) * (abs(diff_x) ** 1.3) * self.base_sensitivity
+        scaled_y = 0.5 + np.sign(diff_y) * (abs(diff_y) ** 1.3) * self.base_sensitivity
         
-        # 2. KALMAN FILTER MEASUREMENT UPDATE (Instant Jitter Suppression)
+        # Project values to absolute pixel dimensions
+        target_x = scaled_x * self.screen_w
+        target_y = scaled_y * self.screen_h
+        
+        # 2. STATE CORRECTION & STABILIZATION (KALMAN)
         measurement = np.array([[np.float32(target_x)], [np.float32(target_y)]], np.float32)
         self.kalman.correct(measurement)
         
-        # Extract stabilized coordinates directly from the updated tracking engine state
         self.smooth_x = self.kalman.statePost[0][0]
         self.smooth_y = self.kalman.statePost[1][0]
         
-        # Clean Border Safe Clipping
-        self.smooth_x = max(8, min(self.screen_w - 8, self.smooth_x))
-        self.smooth_y = max(8, min(self.screen_h - 8, self.smooth_y))
+        # Dynamic Safe Margins
+        self.smooth_x = max(10, min(self.screen_w - 10, self.smooth_x))
+        self.smooth_y = max(10, min(self.screen_h - 10, self.smooth_y))
 
-        # 3. ADVANCED CLICK HANDLING SYSTEM
+        # 3. TIME-BASED CLICK SYSTEM
         left_eye_top = landmarks[386]
         left_eye_bottom = landmarks[374]
         left_eye_inner = landmarks[362]
@@ -227,46 +222,46 @@ class AdvancedGazeController:
             countdown = max(0.0, 1.0 - elapsed)
             
             if countdown > 0:
-                cv2.putText(frame, f"Triggering Click: {countdown:.1f}s", (40, 100), 
+                cv2.putText(frame, f"Holding Action: {countdown:.1f}s", (40, 100), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 140, 255), 2, cv2.LINE_AA)
             
             if elapsed >= 1.0 and not self.click_triggered:
                 pyautogui.click()
-                print("💥 Click Dispatched!")
+                print("💥 Mouse Click Dispatched Safely!")
                 self.click_triggered = True
         else:
             self.blink_start_time = None
             self.click_triggered = False
-            # Dispatch filtered positional coordinates to operating system cursor
+            # Move the cursor only when our tracking state is valid and eye is wide open
             pyautogui.moveTo(int(self.smooth_x), int(self.smooth_y))
 
-        # Diagnostics Window Elements
+        # Graphic overlay metrics
         cv2.circle(frame, (int(left_iris.x * img_w), int(left_iris.y * img_h)), 4, (0, 255, 0), -1)
-        cv2.putText(frame, f"Tracking State: OK | EAR: {ear_ratio:.2f}", (30, 50), 
+        cv2.putText(frame, f"System Active | EAR: {ear_ratio:.2f}", (30, 50), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2, cv2.LINE_AA)
         
         return frame
 
 def main():
-    controller = AdvancedGazeController()
+    controller = UltimateGazeController()
     cap = cv2.VideoCapture(0)
     
     if not cap.isOpened():
-        print("Hardware Error: Video capture device could not be opened.")
+        print("Hardware Fault: Primary camera capture stream inaccessible.")
         return
 
-    # Build borderless window properties
-    cv2.namedWindow('System Output Display', cv2.WINDOW_NORMAL)
-    cv2.setWindowProperty('System Output Display', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    # Initialize Fullscreen View canvas
+    cv2.namedWindow('System Production Monitor', cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty('System Production Monitor', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    # Initialize calibration matrix setup
+    # Perform runtime matrix setup calibration
     controller.run_calibration(cap)
     
-    # Restore interface display format
-    cv2.setWindowProperty('System Output Display', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow('System Output Display', 640, 480)
+    # Resize tracking monitor window frame seamlessly
+    cv2.setWindowProperty('System Production Monitor', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow('System Production Monitor', 640, 480)
     
-    print("\n>>> System live! Press 'q' inside the camera tracking window to exit safely.")
+    print("\n>>> Control Engine Running Smoothly. Focus eye on corners to watch adaptation work.")
     while cap.isOpened():
         success, frame = cap.read()
         if not success: continue
@@ -274,13 +269,13 @@ def main():
         frame = cv2.flip(frame, 1)
         processed_frame = controller.update_pipeline(frame)
         
-        cv2.imshow('System Output Display', processed_frame)
+        cv2.imshow('System Production Monitor', processed_frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
             
     cap.release()
     cv2.destroyAllWindows()
-    print("Clean shutdown sequence complete.")
+    print("Application closed properly.")
 
 if __name__ == "__main__":
     main()
