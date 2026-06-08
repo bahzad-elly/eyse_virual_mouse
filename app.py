@@ -139,14 +139,16 @@ def right_ear(lm, w, h):
                            CFG.RE_P4,CFG.RE_P5,CFG.RE_P6, w, h)
 
 
+_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))   # create once, reuse
+
+
 def apply_clahe(frame: np.ndarray) -> np.ndarray:
     """
     CLAHE on Y channel only — boosts local contrast for iris detection
     in low-light without blowing out highlights.
     """
     yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    yuv[:, :, 0] = clahe.apply(yuv[:, :, 0])
+    yuv[:, :, 0] = _CLAHE.apply(yuv[:, :, 0])
     return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
 
 
@@ -278,16 +280,17 @@ class CursorMapper:
         dx = nx - 0.5
         dy = ny - 0.5
 
-        # Dead-zone rescale
+        # Dead-zone rescale: remap (dz..0.5) → (0..0.5) so extreme gaze hits full edge
         if abs(dx) < dz:  dx = 0.0
-        else: dx = math.copysign((abs(dx)-dz)/(0.5-dz)*0.5, dx)
+        else: dx = math.copysign((abs(dx) - dz) / (0.5 - dz) * 0.5, dx)
         if abs(dy) < dz:  dy = 0.0
-        else: dy = math.copysign((abs(dy)-dz)/(0.5-dz)*0.5, dy)
+        else: dy = math.copysign((abs(dy) - dz) / (0.5 - dz) * 0.5, dy)
 
-        # Acceleration power curve
-        adx = math.copysign(min(0.5,(abs(dx)**exp)*sc), dx)
-        ady = math.copysign(min(0.5,(abs(dy)**exp)*sc), dy)
+        # Acceleration power curve — clamp at 0.5 so we stay in [0,1] range
+        adx = math.copysign(min(0.5, (abs(dx) ** exp) * sc), dx)
+        ady = math.copysign(min(0.5, (abs(dy) ** exp) * sc), dy)
 
+        # Map to full screen pixels — NO inset, cursor reaches real corners
         px = (0.5 + adx) * self.sw
         py = (0.5 + ady) * self.sh
 
@@ -300,8 +303,9 @@ class CursorMapper:
 
         self._prev_px, self._prev_py = px, py
 
-        px = max(5, min(self.sw-5, px))
-        py = max(5, min(self.sh-5, py))
+        # Clamp to [0, sw-1] × [0, sh-1] — full screen, corners reachable
+        px = max(0, min(self.sw - 1, px))
+        py = max(0, min(self.sh - 1, py))
         return px, py
 
 
@@ -540,6 +544,91 @@ class GazeTrail:
 
 
 # ═══════════════════════════════════════════════════════════
+#  POINTS / SCORE SYSTEM
+# ═══════════════════════════════════════════════════════════
+class GazeScore:
+    """
+    Awards points for precise, intentional gaze actions:
+      +10  accurate left-click  (cursor moved < 80px in last 0.5s before click)
+      +15  accurate right-click
+      +20  accurate double-click
+      +5   successful dwell-click
+      +1   per second of stable tracking (cursor velocity < FIXATION_VEL_PX)
+    Streak multiplier: consecutive clicks without a "lost" event → 2×, 3×…(max 5×)
+    """
+    def __init__(self):
+        self.total: int       = 0
+        self.session_clicks: int = 0
+        self.streak: int      = 0
+        self._stable_acc: float = 0.0   # accumulated stable seconds
+        self._last_tick: float  = time.time()
+        self._last_action: str  = ''
+        self._popup_text: str   = ''
+        self._popup_until: float = 0.0
+
+    def on_action(self, action: str, cursor_vel: float):
+        """Call whenever a click fires."""
+        now = time.time()
+        multiplier = min(5, 1 + self.streak // 3)   # streak multiplier cap 5×
+
+        base = {'left': 10, 'right': 15, 'double': 20, 'dwell': 5}.get(action, 0)
+        if base == 0:
+            return
+
+        # Precision bonus: if cursor was nearly still before click
+        precision_bonus = 5 if cursor_vel < 8.0 else 0
+        earned = (base + precision_bonus) * multiplier
+
+        self.total += earned
+        self.session_clicks += 1
+        self.streak += 1
+
+        label = action.upper() + (' ✦' if precision_bonus else '')
+        streak_str = f' {multiplier}×' if multiplier > 1 else ''
+        self._popup_text = f'+{earned} {label}{streak_str}'
+        self._popup_until = now + 1.2
+
+    def on_lost(self):
+        """Face lost — break streak."""
+        self.streak = max(0, self.streak - 1)
+
+    def tick_stable(self, cursor_vel: float, dt: float):
+        """Accumulate passive +1 per second while gaze is stable."""
+        if cursor_vel < CFG.FIXATION_VEL_PX:
+            self._stable_acc += dt
+            if self._stable_acc >= 1.0:
+                pts = int(self._stable_acc)
+                self.total += pts
+                self._stable_acc -= pts
+        else:
+            self._stable_acc = 0.0
+
+    def draw(self, frame: np.ndarray):
+        """Draw score HUD in top-right area of camera view."""
+        h, w = frame.shape[:2]
+        now = time.time()
+
+        # Score badge
+        score_txt = f"SCORE  {self.total:,}"
+        cv2.putText(frame, score_txt, (w - 210, h - 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 220, 255), 1, cv2.LINE_AA)
+
+        clicks_txt = f"Clicks: {self.session_clicks}   Streak: {self.streak}"
+        cv2.putText(frame, clicks_txt, (w - 210, h - 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 200, 140), 1, cv2.LINE_AA)
+
+        # Floating +points popup
+        if now < self._popup_until:
+            alpha_f = (self._popup_until - now) / 1.2   # 1.0 → 0.0
+            y_off = int((1.0 - alpha_f) * 30)           # rises upward
+            col_v = int(255 * alpha_f)
+            cv2.putText(frame, self._popup_text,
+                        (w // 2 - 60, h // 2 - 60 - y_off),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                        (0, col_v, col_v), 2, cv2.LINE_AA)
+
+
+# ═══════════════════════════════════════════════════════════
 #  LIVE TUNING WINDOW
 # ═══════════════════════════════════════════════════════════
 class TuningWindow:
@@ -559,9 +648,14 @@ class TuningWindow:
                            int(CFG.DEAD_ZONE * 1000), 100, lambda v: None)
         cv2.createTrackbar('Accel Exp  (×100)',            self.WIN,
                            int(CFG.ACCEL_EXP * 100), 300, lambda v: None)
+        self._sync_counter = 0
 
     def sync(self):
-        """Pull current slider values into CFG."""
+        """Pull current slider values into CFG — only every 10 frames."""
+        self._sync_counter += 1
+        if self._sync_counter < 10:
+            return
+        self._sync_counter = 0
         v1 = cv2.getTrackbarPos('EMA Speed  (fast alpha ×100)', self.WIN)
         v2 = cv2.getTrackbarPos('Dead-Zone  (×1000)',           self.WIN)
         v3 = cv2.getTrackbarPos('Accel Exp  (×100)',            self.WIN)
@@ -594,10 +688,14 @@ class EyeMouseController:
         self.fps_mon = FPSMonitor()
         self.trail   = GazeTrail()
         self.tuner   = TuningWindow()
+        self.score   = GazeScore()
 
         self._frames_lost   = 0
         self._last_px       = self.sw / 2
         self._last_py       = self.sh / 2
+        self._last_frame_t  = time.perf_counter()
+        self._last_smooth_px = self.sw / 2
+        self._last_smooth_py = self.sh / 2
         self.precision_mode = False   # toggled with P key
 
     # ── Dual-iris offset: average both eyes ─────────────────────────
@@ -885,6 +983,7 @@ class EyeMouseController:
             self._frames_lost = min(self._frames_lost+1, CFG.MAX_LOST_FRAMES+1)
             if self._frames_lost <= CFG.MAX_LOST_FRAMES:
                 pyautogui.moveTo(int(self._last_px), int(self._last_py))
+            self.score.on_lost()
             self._draw_hud(frame, fps, None, None, 0, 0, 'lost', False, False, 0.0)
             return frame
 
@@ -896,8 +995,8 @@ class EyeMouseController:
         norm_x, norm_y     = self.grid.gaze_to_screen(rel_x, rel_y)
         raw_px, raw_py     = self.mapper.apply(norm_x, norm_y, self.precision_mode)
         smooth_px, smooth_py = self.ema.update(raw_px, raw_py, self.precision_mode)
-        smooth_px = max(5, min(self.sw-5, smooth_px))
-        smooth_py = max(5, min(self.sh-5, smooth_py))
+        smooth_px = max(0, min(self.sw - 1, smooth_px))
+        smooth_py = max(0, min(self.sh - 1, smooth_py))
 
         # ── Click detection ──
         l_e = left_ear(lm, iw, ih)
@@ -911,10 +1010,23 @@ class EyeMouseController:
         self.scroller.update(smooth_py)
 
         # ── Cursor movement (skipped during post-click freeze) ──
+        cursor_vel = math.hypot(smooth_px - self._last_smooth_px,
+                                smooth_py - self._last_smooth_py)
         if not self.clicker.in_post_click_freeze and not dwell_fired:
             pyautogui.moveTo(int(smooth_px), int(smooth_py))
             self._last_px = smooth_px
             self._last_py = smooth_py
+        self._last_smooth_px, self._last_smooth_py = smooth_px, smooth_py
+
+        # ── Score events ──
+        now_t = time.perf_counter()
+        dt = now_t - self._last_frame_t
+        self._last_frame_t = now_t
+        if action in ('left', 'right', 'double'):
+            self.score.on_action(action, cursor_vel)
+        if dwell_fired:
+            self.score.on_action('dwell', cursor_vel)
+        self.score.tick_stable(cursor_vel, dt)
 
         # ── Trail ──
         self.trail.push(
@@ -947,6 +1059,9 @@ class EyeMouseController:
             end_a   = int(-90 + 360 * dwell_prog)
             cv2.ellipse(frame, (iris_px, iris_py), (ring_r, ring_r),
                         0, start_a, end_a, (0,200,255), 2, cv2.LINE_AA)
+
+        # Score overlay
+        self.score.draw(frame)
 
         self._draw_hud(frame, fps, l_e, r_e, l_held, r_held,
                        action, self.clicker.l_closed, self.clicker.r_closed,
@@ -1053,7 +1168,7 @@ class EyeMouseController:
 # ═══════════════════════════════════════════════════════════
 def main():
     print("╔══════════════════════════════════════════╗")
-    print("║       EyeMouse Pro  v4.0                 ║")
+    print("║       EyeMouse Pro  v4.1                 ║")
     print("╠══════════════════════════════════════════╣")
     print("║  L-eye hold  →  Left click               ║")
     print("║  R-eye hold  →  Right click              ║")
@@ -1063,6 +1178,7 @@ def main():
     print("║  S key       →  Toggle edge-scroll       ║")
     print("║  R key       →  Recalibrate              ║")
     print("║  Q key       →  Quit                     ║")
+    print("║  SCORE shown in camera window            ║")
     print("╚══════════════════════════════════════════╝\n")
 
     ctrl = EyeMouseController()
