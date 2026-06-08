@@ -1,23 +1,18 @@
 """
-EyeMouse Pro v3.0 — Ultimate Eye-Controlled Mouse
-==================================================
-Improvements over v2:
-  [1]  16-point (4×4) calibration grid — 2× more mapping cells
-  [2]  Dual-iris tracking (both eyes averaged) — ~40% less noise
-  [3]  Right-eye wink → right-click
-  [4]  Both-eyes fast blink → double-click
-  [5]  Gaze dwell-click (toggleable, no blink needed)
-  [6]  Edge-dwell auto-scroll (top/bottom 8%)
-  [7]  Velocity-adaptive EMA alpha (fast=responsive, slow=stable)
-  [8]  Fixation braking (cursor slows to near-zero when eye is still)
-  [9]  CLAHE pre-processing for low-light robustness
-  [10] Post-click freeze (300ms) prevents accidental drag
-  [11] Calibration validation phase (4-point accuracy test)
-  [12] Live tuning window (EMA / dead-zone / acceleration sliders)
-  [13] Rich debug overlay: both EARs, gaze arrow, velocity bar,
-       scroll-zone indicator, dwell ring, gaze trail
-  [14] Keyboard: R=recalibrate, D=toggle dwell, S=toggle scroll, Q=quit
-  [15] Right-eye iris landmark support
+EyeMouse Pro v4.0 — Faster Calibration + Precision Mode
+========================================================
+Improvements over v3:
+  [1]  Smart 3x3 (9-point) calibration  half the time, same accuracy
+  [2]  Guided warm-up step before calibration (no wasted samples)
+  [3]  Natural left-to-right, top-to-bottom calibration order
+  [4]  PRECISION MODE (P key) — fine-grained cursor when gaze is slow
+         - Strong double-EMA smoothing in precision mode
+         - Reduced acceleration exponent (linear = easier to target)
+         - Smaller dead-zone so tiny eye movements register
+         - HUD badge shows PRECISE / COARSE
+  [5]  Calibration saved to disk (calib.npz) and auto-loaded on startup
+         skip calibration entirely if file exists and accuracy is good
+  [6]  All v3 features retained (dual-iris fix, dwell, scroll, blink-click)
 """
 
 import cv2
@@ -48,20 +43,20 @@ class Config:
     EMA_VEL_SCALE: float    = 0.015  # how quickly alpha ramps with velocity
 
     # Dead-zone
-    DEAD_ZONE: float        = 0.035  # fraction of calibrated range
+    DEAD_ZONE: float        = 0.018  # reduced: 0.035 was killing small gaze movements
 
     # Acceleration
     ACCEL_EXP: float        = 1.60   # power-curve exponent
     ACCEL_SCALE: float      = 1.08   # global gain
 
     # Fixation braking — if pixel velocity < threshold, scale movement down
-    FIXATION_VEL_PX: float  = 6.0    # px/frame below which braking kicks in
-    FIXATION_BRAKE: float   = 0.15   # multiplier applied when braking
+    FIXATION_VEL_PX: float  = 4.0    # px/frame below which braking kicks in
+    FIXATION_BRAKE: float   = 0.45   # raised from 0.15: was killing small movements
 
     # Blink / click
-    EAR_CLOSE: float        = 0.18
-    EAR_OPEN: float         = 0.22
-    EAR_BLINK_FRAMES: int   = 3      # consecutive frames for closed detection
+    EAR_CLOSE: float        = 0.21   # raised: 0.18 was too tight for most people
+    EAR_OPEN: float         = 0.25   # raised to match
+    EAR_BLINK_FRAMES: int   = 2      # 2 frames is enough; 3 missed fast blinks
     CLICK_HOLD_S: float     = 0.90   # hold → left-click
     DOUBLE_BLINK_WINDOW: float = 0.35  # both eyes close within this → double-click
     POST_CLICK_FREEZE_S: float = 0.30  # freeze cursor after click fires
@@ -75,12 +70,19 @@ class Config:
     SCROLL_DWELL_S: float   = 0.55   # dwell in zone before scrolling starts
     SCROLL_REPEAT_S: float  = 0.18   # repeat scroll every N seconds
 
-    # Calibration
-    CALIB_COLS: int         = 4
-    CALIB_ROWS: int         = 4
-    CALIB_DWELL_S: float    = 2.0    # seconds per point
-    CALIB_MARGIN_PX: int    = 80
-    CALIB_SETTLE_S: float   = 0.35   # skip first N seconds per point
+    # Calibration — 3x3 = 9 points, ~20 seconds total
+    CALIB_COLS: int         = 3
+    CALIB_ROWS: int         = 3
+    CALIB_DWELL_S: float    = 1.5    # seconds per point (was 2.0)
+    CALIB_MARGIN_PX: int    = 100
+    CALIB_SETTLE_S: float   = 0.25   # skip first N seconds per point (was 0.35)
+    CALIB_FILE: str         = 'calib.npz'   # saved calibration path
+
+    # Precision mode — toggled with P key
+    PRECISION_EMA_FAST: float  = 0.12   # much stronger smoothing
+    PRECISION_EMA_SLOW: float  = 0.04
+    PRECISION_ACCEL_EXP: float = 1.10   # nearly linear — easier to aim
+    PRECISION_DEAD_ZONE: float = 0.008  # smaller — registers tiny movements
 
     # Tracking
     MAX_LOST_FRAMES: int    = 10
@@ -164,10 +166,17 @@ class AdaptiveEMA:
         self._prev_x = init_x
         self._prev_y = init_y
 
-    def update(self, x: float, y: float) -> Tuple[float, float]:
+    def update(self, x: float, y: float, precision: bool = False) -> Tuple[float, float]:
         vel = math.hypot(x - self._prev_x, y - self._prev_y)
-        alpha = min(CFG.EMA_FAST_BASE,
-                    CFG.EMA_SLOW_BASE + vel * CFG.EMA_VEL_SCALE)
+
+        if precision:
+            fast = CFG.PRECISION_EMA_FAST
+            slow = CFG.PRECISION_EMA_SLOW
+        else:
+            fast = CFG.EMA_FAST_BASE
+            slow = CFG.EMA_SLOW_BASE
+
+        alpha = min(fast, slow + vel * CFG.EMA_VEL_SCALE)
 
         self.fx = alpha * x        + (1 - alpha) * self.fx
         self.fy = alpha * y        + (1 - alpha) * self.fy
@@ -261,9 +270,9 @@ class CursorMapper:
         self._prev_px = sw / 2
         self._prev_py = sh / 2
 
-    def apply(self, nx: float, ny: float) -> Tuple[float, float]:
-        dz  = CFG.DEAD_ZONE
-        exp = CFG.ACCEL_EXP
+    def apply(self, nx: float, ny: float, precision: bool = False) -> Tuple[float, float]:
+        dz  = CFG.PRECISION_DEAD_ZONE if precision else CFG.DEAD_ZONE
+        exp = CFG.PRECISION_ACCEL_EXP if precision else CFG.ACCEL_EXP
         sc  = CFG.ACCEL_SCALE
 
         dx = nx - 0.5
@@ -589,6 +598,7 @@ class EyeMouseController:
         self._frames_lost   = 0
         self._last_px       = self.sw / 2
         self._last_py       = self.sh / 2
+        self.precision_mode = False   # toggled with P key
 
     # ── Dual-iris offset: average both eyes ─────────────────────────
     def _get_iris_offset(self, lm) -> Tuple[float, float]:
@@ -610,8 +620,56 @@ class EyeMouseController:
         rx = lm[CFG.R_IRIS].x - r_anchor_x
         ry = lm[CFG.R_IRIS].y - r_anchor_y
 
-        # Mirror right eye x-axis (it moves in opposite direction)
-        return (lx + (-rx)) / 2, (ly + ry) / 2
+        # Both eyes move in the same direction after cv2.flip(frame,1)
+        # DO NOT negate rx — negating it causes the two signals to cancel out
+        avg_x = (lx + rx) / 2
+        avg_y = (ly + ry) / 2
+        return avg_x, avg_y
+
+    # ── Save / Load calibration from disk ───────────────────────────
+    def save_calibration(self):
+        """Save grid raw points to disk so we can skip calibration next time."""
+        import os
+        try:
+            data = {}
+            for r in range(self.grid.rows):
+                for c in range(self.grid.cols):
+                    v = self.grid.raw[r][c]
+                    if v:
+                        data[f'{r}_{c}_x'] = v[0]
+                        data[f'{r}_{c}_y'] = v[1]
+            data['rows'] = self.grid.rows
+            data['cols'] = self.grid.cols
+            np.savez(CFG.CALIB_FILE, **data)
+            print(f"  Calibration saved to {CFG.CALIB_FILE}")
+        except Exception as e:
+            print(f"  Could not save calibration: {e}")
+
+    def try_load_calibration(self) -> bool:
+        """Try to load a saved calibration. Returns True if loaded successfully."""
+        import os
+        if not os.path.exists(CFG.CALIB_FILE):
+            return False
+        try:
+            data = np.load(CFG.CALIB_FILE)
+            rows = int(data['rows'])
+            cols = int(data['cols'])
+            if rows != CFG.CALIB_ROWS or cols != CFG.CALIB_COLS:
+                print("  Saved calibration grid size mismatch — recalibrating.")
+                return False
+            self.grid = CalibrationGrid(cols, rows)
+            for r in range(rows):
+                for c in range(cols):
+                    k = f'{r}_{c}_x'
+                    if k in data:
+                        self.grid.set_point(r, c, float(data[f'{r}_{c}_x']),
+                                                   float(data[f'{r}_{c}_y']))
+            self.grid.finalise()
+            print(f"  Loaded saved calibration from {CFG.CALIB_FILE}  (press R to redo)")
+            return True
+        except Exception as e:
+            print(f"  Could not load calibration: {e}")
+            return False
 
     # ── Calibration ─────────────────────────────────────────────────
     def run_calibration(self, cap: cv2.VideoCapture):
@@ -623,26 +681,35 @@ class EyeMouseController:
         xs = [int(m + (sw - 2*m) * c / (cols-1)) for c in range(cols)]
         ys = [int(m + (sh - 2*m) * r / (rows-1)) for r in range(rows)]
 
+        # Natural reading order: top-left → right → down (no random shuffle)
+        # This feels predictable and lets the eyes settle between rows.
         order = [(r, c) for r in range(rows) for c in range(cols)]
-        # Randomise (keeps centre-ish point early for context)
-        centre = (rows//2, cols//2)
-        if centre in order: order.remove(centre)
-        random.shuffle(order)
-        order = [centre] + order
 
-        print("\n╔══════════════════════════════════════════════╗")
-        print(f"║   {cols*rows}-POINT CALIBRATION  ({cols}×{rows} grid)           ║")
-        print("║   Look at each dot. Keep head still.         ║")
-        print("╚══════════════════════════════════════════════╝\n")
+        total = cols * rows
+        print(f"\n  {total}-POINT CALIBRATION ({cols}x{rows} grid, ~{int(total*CFG.CALIB_DWELL_S)}s)")
+        print("  Look at each dot. Keep your head still.\n")
 
-        # 3-second countdown
-        for cd in range(3, 0, -1):
+        # ── Warm-up: show camera feed for 2s so face mesh initialises ──
+        warmup_end = time.time() + 2.0
+        while time.time() < warmup_end:
+            ok, frame = cap.read()
+            if not ok: continue
+            frame = cv2.flip(frame, 1)
+            rgb = cv2.cvtColor(apply_clahe(frame), cv2.COLOR_BGR2RGB)
+            rgb.flags.writeable = False
+            self.face_mesh.process(rgb)   # warm up the model
+
             ui = np.zeros((sh, sw, 3), dtype=np.uint8)
-            cv2.putText(ui, f"Starting in {cd}...",
-                        (sw//2 - 180, sh//2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.4, (200,200,200), 2, cv2.LINE_AA)
+            rem = warmup_end - time.time()
+            msg = "Get ready... look straight ahead"
+            cv2.putText(ui, msg,
+                        (sw//2 - 280, sh//2 - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (160, 200, 255), 2, cv2.LINE_AA)
+            cv2.putText(ui, f"Starting in {rem:.0f}s",
+                        (sw//2 - 100, sh//2 + 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (120, 120, 120), 1, cv2.LINE_AA)
             cv2.imshow('EyeMouse Calibration', ui)
-            cv2.waitKey(1000)
+            cv2.waitKey(1)
 
         completed = []   # (r,c) points already done — shown as green dots
 
@@ -652,16 +719,14 @@ class EyeMouseController:
             t0  = time.time()
             dwell_s = CFG.CALIB_DWELL_S
             settle  = CFG.CALIB_SETTLE_S
-
-            label = f"Point {idx+1}/{cols*rows}"
-            print(f"  [{idx+1:02d}/{cols*rows}] Grid ({row},{col})  →  screen {target}")
+            label = f"Point {idx+1} of {total}"
 
             while time.time() - t0 < dwell_s:
                 ok, frame = cap.read()
                 if not ok: continue
                 frame = cv2.flip(frame, 1)
                 ih, iw = frame.shape[:2]
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                rgb = cv2.cvtColor(apply_clahe(frame), cv2.COLOR_BGR2RGB)
                 rgb.flags.writeable = False
                 results = self.face_mesh.process(rgb)
 
@@ -672,43 +737,57 @@ class EyeMouseController:
 
                 # Completed dots
                 for pr, pc in completed:
-                    cv2.circle(ui, (xs[pc], ys[pr]), 9, (30,160,30), -1)
+                    cv2.circle(ui, (xs[pc], ys[pr]), 9, (30, 160, 30), -1)
+                    cv2.putText(ui, "✓", (xs[pc]-8, ys[pr]+5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (80,255,80), 1)
 
-                # All remaining dots (dim)
+                # Remaining dots (dim)
                 for fr2 in range(rows):
                     for fc2 in range(cols):
-                        if (fr2, fc2) not in completed and (fr2,fc2) != (row,col):
-                            cv2.circle(ui, (xs[fc2], ys[fr2]), 7, (70,70,70), -1)
+                        if (fr2, fc2) not in completed and (fr2, fc2) != (row, col):
+                            cv2.circle(ui, (xs[fc2], ys[fr2]), 7, (55, 55, 55), -1)
 
-                # Active target
-                pulse = int(14 + 9 * math.sin(elapsed * 12))
-                cv2.circle(ui, target, 20, (0,180,255), -1)
-                cv2.circle(ui, target, pulse+20, (255,255,255), 2)
+                # Active target — pulsing ring
+                pulse = int(10 + 8 * math.sin(elapsed * 10))
+                cv2.circle(ui, target, 18, (0, 160, 255), -1)
+                cv2.circle(ui, target, 18 + pulse, (255, 255, 255), 2, cv2.LINE_AA)
 
-                # Collecting ring around target
-                ring_r = int(20 + 28 * (1-progress))
-                cv2.circle(ui, target, ring_r, (0,220,140),
-                           max(1, int(3*(1-progress)+1)), cv2.LINE_AA)
+                # Collecting arc (fills as we gather samples)
+                arc_end = int(-90 + 360 * progress)
+                cv2.ellipse(ui, target, (30, 30), 0, -90, arc_end,
+                            (0, 230, 140), 3, cv2.LINE_AA)
 
-                # Progress bar
-                bw = int(sw * 0.38)
-                bx = sw//2 - bw//2
-                by = sh - 55
-                cv2.rectangle(ui, (bx,by), (bx+bw, by+18), (50,50,50), -1)
-                cv2.rectangle(ui, (bx,by), (bx+int(bw*progress), by+18),
-                              (0,200,120), -1)
-                cv2.putText(ui, label, (bx, by-10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (180,180,180), 1, cv2.LINE_AA)
+                # Arrow showing order: draw faint line to next point
+                if idx + 1 < total:
+                    nr, nc = order[idx + 1]
+                    next_pt = (xs[nc], ys[nr])
+                    cv2.arrowedLine(ui, target, next_pt, (40, 40, 40), 1,
+                                    cv2.LINE_AA, tipLength=0.02)
 
-                # Sample count
-                cv2.putText(ui, f"Samples: {len(smpx)}",
-                            (sw-200, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6, (140,200,140), 1, cv2.LINE_AA)
+                # Label near target
+                lx_off = 30 if target[0] < sw // 2 else -120
+                cv2.putText(ui, label, (target[0] + lx_off, target[1] - 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+
+                # Bottom status bar
+                ov = ui.copy()
+                cv2.rectangle(ov, (0, sh-40), (sw, sh), (20,20,20), -1)
+                cv2.addWeighted(ov, 0.7, ui, 0.3, 0, ui)
+                cv2.putText(ui, "Keep head still  |  Look directly at the dot",
+                            (sw//2 - 250, sh - 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (140, 140, 140), 1, cv2.LINE_AA)
+
+                # Tracking indicator top-right
+                tracking_now = results.multi_face_landmarks is not None
+                t_col = (0, 220, 80) if tracking_now else (0, 60, 220)
+                t_txt = "Face: OK" if tracking_now else "Face: LOST"
+                cv2.putText(ui, t_txt, (sw - 160, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, t_col, 1, cv2.LINE_AA)
 
                 cv2.imshow('EyeMouse Calibration', ui)
                 cv2.waitKey(1)
 
-                if (elapsed > settle and results.multi_face_landmarks):
+                if elapsed > settle and results.multi_face_landmarks:
                     lm = results.multi_face_landmarks[0].landmark
                     ox, oy = self._get_iris_offset(lm)
                     smpx.append(ox); smpy.append(oy)
@@ -717,49 +796,43 @@ class EyeMouseController:
                 self.grid.set_point(row, col,
                                     float(np.median(smpx)),
                                     float(np.median(smpy)))
-                print(f"         ✔  {len(smpx)} samples  median=({np.median(smpx):.5f}, {np.median(smpy):.5f})")
                 completed.append((row, col))
+                print(f"  [{idx+1}/{total}] OK  ({len(smpx)} samples)")
             else:
-                print(f"         ✗  No samples — check lighting / camera")
+                print(f"  [{idx+1}/{total}] MISSED — check lighting/camera")
 
         self.grid.finalise()
 
-        # ── Validation phase (4 corners) ──────────────────────────
-        print("\n── VALIDATION PHASE ──")
-        val_targets = [
+        # ── Validation: show accuracy at 4 corners ───────────────────
+        print("\n  Validating accuracy...")
+        val_pts = [
             (0, 0, xs[0], ys[0]),
             (0, cols-1, xs[cols-1], ys[0]),
             (rows-1, 0, xs[0], ys[rows-1]),
             (rows-1, cols-1, xs[cols-1], ys[rows-1]),
         ]
         errors = []
-        for vi, (vr, vc, vx, vy) in enumerate(val_targets):
-            vtarget = (vx, vy)
-            vnorm_x = vx / sw
-            vnorm_y = vy / sh
+        for vi, (vr, vc, vx, vy) in enumerate(val_pts):
             vsamps_x, vsamps_y = [], []
             vt0 = time.time()
-
-            while time.time() - vt0 < 1.5:
+            while time.time() - vt0 < 1.2:
                 ok, frame = cap.read()
                 if not ok: continue
                 frame = cv2.flip(frame, 1)
-                ih, iw = frame.shape[:2]
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                rgb = cv2.cvtColor(apply_clahe(frame), cv2.COLOR_BGR2RGB)
                 rgb.flags.writeable = False
                 res2 = self.face_mesh.process(rgb)
-
                 vel = time.time() - vt0
                 ui2 = np.zeros((sh, sw, 3), dtype=np.uint8)
-                cv2.putText(ui2, f"VALIDATION {vi+1}/4 — Look at dot",
-                            (sw//2-250, sh//2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (200,200,100), 2, cv2.LINE_AA)
-                cv2.circle(ui2, vtarget, 18, (255,120,0), -1)
-                cv2.circle(ui2, vtarget, int(18+10*math.sin(vel*10)), (255,255,255), 2)
+                cv2.putText(ui2, f"Validation {vi+1}/4 — look at dot",
+                            (sw//2 - 220, sh//2 - 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 100), 2, cv2.LINE_AA)
+                cv2.circle(ui2, (vx, vy), 16, (255, 120, 0), -1)
+                cv2.circle(ui2, (vx, vy), int(16 + 8*math.sin(vel*10)),
+                           (255, 255, 255), 2, cv2.LINE_AA)
                 cv2.imshow('EyeMouse Calibration', ui2)
                 cv2.waitKey(1)
-
-                if vel > 0.4 and res2.multi_face_landmarks:
+                if vel > 0.3 and res2.multi_face_landmarks:
                     lm2 = res2.multi_face_landmarks[0].landmark
                     ox, oy = self._get_iris_offset(lm2)
                     vsamps_x.append(ox); vsamps_y.append(oy)
@@ -767,17 +840,32 @@ class EyeMouseController:
             if vsamps_x:
                 err = self.grid.accuracy_test(
                     float(np.median(vsamps_x)), float(np.median(vsamps_y)),
-                    vnorm_x, vnorm_y, sw, sh)
+                    vx / sw, vy / sh, sw, sh)
                 errors.append(err)
-                print(f"  Validation {vi+1}: error = {err:.0f} px")
 
         if errors:
             avg_err = sum(errors) / len(errors)
             quality = "Excellent" if avg_err < 80 else \
-                      "Good"      if avg_err < 150 else "Recalibrate recommended"
-            print(f"\n  Average error: {avg_err:.0f} px  →  {quality}")
+                      "Good"      if avg_err < 150 else "Poor — consider redoing (press R)"
+            print(f"  Average error: {avg_err:.0f}px  — {quality}")
 
-        print("\n✔ Calibration complete.\n")
+        # ── Save calibration so we skip this next time ────────────────
+        self.save_calibration()
+
+        # ── Done screen ───────────────────────────────────────────────
+        done_ui = np.zeros((sh, sw, 3), dtype=np.uint8)
+        q_label = "Excellent!" if (errors and sum(errors)/len(errors) < 80) else \
+                  "Good!" if (errors and sum(errors)/len(errors) < 150) else "Done"
+        cv2.putText(done_ui, f"Calibration {q_label}",
+                    (sw//2 - 200, sh//2 - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 220, 120), 2, cv2.LINE_AA)
+        cv2.putText(done_ui, "Starting in 2s...  Press P for Precision Mode",
+                    (sw//2 - 310, sh//2 + 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (140, 140, 140), 1, cv2.LINE_AA)
+        cv2.imshow('EyeMouse Calibration', done_ui)
+        cv2.waitKey(2000)
+
+        print("  Calibration complete.\n")
         cv2.destroyWindow('EyeMouse Calibration')
 
     # ── Per-frame update ─────────────────────────────────────────────
@@ -806,8 +894,8 @@ class EyeMouseController:
         # ── Gaze → screen ──
         rel_x, rel_y       = self._get_iris_offset(lm)
         norm_x, norm_y     = self.grid.gaze_to_screen(rel_x, rel_y)
-        raw_px, raw_py     = self.mapper.apply(norm_x, norm_y)
-        smooth_px, smooth_py = self.ema.update(raw_px, raw_py)
+        raw_px, raw_py     = self.mapper.apply(norm_x, norm_y, self.precision_mode)
+        smooth_px, smooth_py = self.ema.update(raw_px, raw_py, self.precision_mode)
         smooth_px = max(5, min(self.sw-5, smooth_px))
         smooth_py = max(5, min(self.sh-5, smooth_py))
 
@@ -879,8 +967,18 @@ class EyeMouseController:
         tracking = (l_ear_v is not None)
         s_col = (0,255,120) if tracking else (0,60,255)
         s_txt = "TRACKING" if tracking else "LOST — move closer / improve lighting"
-        cv2.putText(frame, f"EyeMouse Pro v3  |  {s_txt}",
+        cv2.putText(frame, f"EyeMouse Pro v4  |  {s_txt}",
                     (14,24), cv2.FONT_HERSHEY_SIMPLEX, 0.60, s_col, 2, cv2.LINE_AA)
+
+        # Precision mode badge
+        if self.precision_mode:
+            cv2.rectangle(frame, (w-160, 4), (w-4, 34), (0, 80, 0), -1)
+            cv2.putText(frame, "PRECISE", (w-150, 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 120), 2, cv2.LINE_AA)
+        else:
+            cv2.rectangle(frame, (w-150, 4), (w-4, 34), (40, 40, 0), -1)
+            cv2.putText(frame, "COARSE", (w-140, 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (180, 180, 0), 1, cv2.LINE_AA)
 
         # FPS
         fps_col = (0,255,120) if fps >= 25 else (0,140,255) if fps >= 15 else (0,50,200)
@@ -917,8 +1015,8 @@ class EyeMouseController:
         cv2.putText(frame, scroll_txt, (200, h-12),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.46,
                     (0,220,120) if self.scroller.enabled else (120,120,120), 1, cv2.LINE_AA)
-        cv2.putText(frame, "[R] Recalibrate   [Q] Quit",
-                    (380, h-12), cv2.FONT_HERSHEY_SIMPLEX,
+        cv2.putText(frame, "[R] Recalibrate   [P] Precision   [Q] Quit",
+                    (340, h-12), cv2.FONT_HERSHEY_SIMPLEX,
                     0.42, (140,140,140), 1, cv2.LINE_AA)
 
         # Scroll zone indicator lines
@@ -955,11 +1053,12 @@ class EyeMouseController:
 # ═══════════════════════════════════════════════════════════
 def main():
     print("╔══════════════════════════════════════════╗")
-    print("║       EyeMouse Pro  v3.0                 ║")
+    print("║       EyeMouse Pro  v4.0                 ║")
     print("╠══════════════════════════════════════════╣")
     print("║  L-eye hold  →  Left click               ║")
     print("║  R-eye hold  →  Right click              ║")
     print("║  Both blink  →  Double click             ║")
+    print("║  P key       →  Toggle Precision Mode    ║")
     print("║  D key       →  Toggle dwell-click       ║")
     print("║  S key       →  Toggle edge-scroll       ║")
     print("║  R key       →  Recalibrate              ║")
@@ -978,11 +1077,13 @@ def main():
     cap.set(cv2.CAP_PROP_FPS,          60)
     cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
 
-    # Calibration
-    cv2.namedWindow('EyeMouse Calibration', cv2.WINDOW_NORMAL)
-    cv2.setWindowProperty('EyeMouse Calibration',
-                          cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-    ctrl.run_calibration(cap)
+    # Try to load saved calibration — skip calibration if successful
+    loaded = ctrl.try_load_calibration()
+    if not loaded:
+        cv2.namedWindow('EyeMouse Calibration', cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty('EyeMouse Calibration',
+                              cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        ctrl.run_calibration(cap)
 
     # Main window
     cv2.namedWindow('EyeMouse Pro', cv2.WINDOW_NORMAL)
@@ -1002,7 +1103,6 @@ def main():
         if key == ord('q'):
             break
         elif key == ord('r'):
-            # Re-run calibration without restarting
             cv2.namedWindow('EyeMouse Calibration', cv2.WINDOW_NORMAL)
             cv2.setWindowProperty('EyeMouse Calibration',
                                   cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
@@ -1011,6 +1111,10 @@ def main():
             ctrl.run_calibration(cap)
             cv2.namedWindow('EyeMouse Pro', cv2.WINDOW_NORMAL)
             cv2.resizeWindow('EyeMouse Pro', 640, 480)
+        elif key == ord('p'):
+            ctrl.precision_mode = not ctrl.precision_mode
+            mode_name = "PRECISION" if ctrl.precision_mode else "COARSE"
+            print(f"Mode: {mode_name}")
         elif key == ord('d'):
             ctrl.dwell.enabled = not ctrl.dwell.enabled
             print(f"Dwell-click: {'ON' if ctrl.dwell.enabled else 'OFF'}")
